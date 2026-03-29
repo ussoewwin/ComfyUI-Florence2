@@ -1,35 +1,35 @@
-# Fix #1: transformers 5.x API 互換性 & Flash Attention 2 対応
+# Fix #1: transformers 5.x API Compatibility & Flash Attention 2 Support
 
-## 問題の本質
+## Root Cause
 
-`transformers` ライブラリが v4.x → v5.x にメジャーアップデートされた際、内部APIに複数の破壊的変更が入った。
-Florence-2 のカスタムモデルコード（`modeling_florence2.py`）は transformers v4.x の内部実装に依存していたため、
-v5.x 環境では**モデルの初期化・ロード段階**でクラッシュまたは不正な状態になる。
+When the `transformers` library was upgraded from v4.x to v5.x, several breaking changes were introduced to internal APIs.
+The Florence-2 custom model code (`modeling_florence2.py`) relied on transformers v4.x internal implementations,
+causing **crashes or invalid state during model initialization/loading** in v5.x environments.
 
-この問題は大きく4つのサブ問題に分解される：
+This issue breaks down into four sub-problems:
 
-| # | 問題 | 発生箇所 | 症状 |
-|---|------|---------|------|
-| A | `_tie_or_clone_weights()` 削除 | `_tie_weights()` | `AttributeError` / 重み共有の破壊 |
-| B | `post_init()` の挙動変更 | `__init__()` | 初期化時のハング・クラッシュ |
-| C | `is_flash_attn_greater_or_equal_2_10` 関数削除 | import 文 | `ImportError` |
-| D | `_supports_flash_attn` 属性の新規要求 | モデル初期化バリデーション | `ValueError: does not support Flash Attention 2` |
+| # | Issue | Location | Symptom |
+|---|-------|----------|---------|
+| A | `_tie_or_clone_weights()` removed | `_tie_weights()` | `AttributeError` / broken weight sharing |
+| B | `post_init()` behavior change | `__init__()` | Hang/crash during initialization |
+| C | `is_flash_attn_greater_or_equal_2_10` function removed | import statement | `ImportError` |
+| D | `_supports_flash_attn` attribute newly required | Model init validation | `ValueError: does not support Flash Attention 2` |
 
 ---
 
-## A. `_tie_or_clone_weights()` の削除
+## A. Removal of `_tie_or_clone_weights()`
 
-### 背景
+### Background
 
-BART ベースのモデルでは、encoder・decoder・lm_head が同一の embedding weight を共有する「weight tying」が行われる。
-transformers v4.x では `PreTrainedModel._tie_or_clone_weights()` というユーティリティメソッドでこれを実現していたが、
-**v5.x ではこのメソッドが削除された**。
+In BART-based models, the encoder, decoder, and lm_head share the same embedding weights via "weight tying."
+In transformers v4.x, this was achieved through a utility method `PreTrainedModel._tie_or_clone_weights()`.
+**In v5.x, this method was removed.**
 
-### 修正したファイル
+### Modified File
 
 `modeling_florence2.py`
 
-### 修正箇所
+### Changes
 
 **`Florence2LanguageModel._tie_weights()`** (L1964-1971):
 
@@ -59,32 +59,33 @@ def _tie_weights(self):
             self.lm_head.weight = self.model.shared.weight
 ```
 
-### 修正の意味
+### Rationale
 
-`hasattr` でメソッドの存在を確認し、v4.x では従来通り `_tie_or_clone_weights()` を使い、
-v5.x では直接 `.weight` 属性を代入する。これにより **両バージョンとの後方互換性**を維持する。
+Uses `hasattr` to check for method existence: v4.x uses `_tie_or_clone_weights()` as before,
+while v5.x falls back to direct `.weight` attribute assignment.
+This maintains **backward compatibility with both versions**.
 
-重み共有が壊れると、encoder/decoder/lm_head がそれぞれ独立したパラメータとなり、
-モデルの推論結果が根本的に狂う（出力がゴミになる、あるいは空になる）。
+When weight sharing is broken, the encoder/decoder/lm_head become independent parameters,
+fundamentally corrupting inference results (producing garbage or empty output).
 
 ---
 
-## B. `post_init()` の挙動変更
+## B. `post_init()` Behavior Change
 
-### 背景
+### Background
 
-`PreTrainedModel.post_init()` は初期化後のウェイト初期化や weight tying を行うメソッド。
-transformers v5.x ではこの内部実装が変更され、`_tie_weights()` の呼び出しタイミングやバリデーションが厳格化された。
+`PreTrainedModel.post_init()` is a method that performs weight initialization and weight tying after construction.
+In transformers v5.x, its internal implementation changed, with stricter validation and different timing for `_tie_weights()` calls.
 
-Florence-2 は `accelerate` の `init_empty_weights` コンテキスト内でモデルを作成し、
-後から手動で weight を設定するというロードフローを取る。
-v5.x の `post_init()` はこのパターンと相性が悪く、空のテンソルに対して不正なバリデーションが走る。
+Florence-2 creates models inside `accelerate`'s `init_empty_weights` context,
+then manually assigns weights afterward.
+The v5.x `post_init()` is incompatible with this pattern, running invalid validation on empty tensors.
 
-### 修正したファイル
+### Modified File
 
 `modeling_florence2.py`
 
-### 修正箇所
+### Changes
 
 **`Florence2LanguageModel.__init__()`** (L1961-1962):
 
@@ -102,7 +103,7 @@ if not version.parse(transformers.__version__) >= version.parse('5.0.0'):
     self.post_init()
 ```
 
-また、`_tied_weights_keys` クラス属性も同様に条件付きに（L1948-1949, L2077-2078）:
+The `_tied_weights_keys` class attribute is also conditionally defined (L1948-1949, L2077-2078):
 
 ```python
 class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
@@ -110,35 +111,35 @@ class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
         _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight"]
 ```
 
-### 修正の意味
+### Rationale
 
-v5.x では `post_init()` を呼ばず、weight tying は `load_model()` 関数内で
-`model.language_model.tie_weights()` を手動で呼ぶ形に変更した。
-`_tied_weights_keys` は v5.x の `from_pretrained()` が使わないロードパスでは不要であり、
-逆に存在すると不整合を起こす可能性があるため、条件付きで除外した。
+On v5.x, `post_init()` is skipped; weight tying is instead handled manually
+by calling `model.language_model.tie_weights()` in the `load_model()` function.
+`_tied_weights_keys` is unnecessary for the v5.x load path (which doesn't use `from_pretrained()`),
+and its presence can cause inconsistencies, so it is conditionally excluded.
 
 ---
 
-## C. `is_flash_attn_greater_or_equal_2_10` の削除
+## C. Removal of `is_flash_attn_greater_or_equal_2_10`
 
-### 背景
+### Background
 
-transformers v4.x では Flash Attention 2.10 以上かどうかを判定する専用関数
-`is_flash_attn_greater_or_equal_2_10` が `transformers.utils` に存在した。
-v5.x ではこれが汎用の `is_flash_attn_greater_or_equal(version_string)` に統合され、
-旧関数は削除された。
+In transformers v4.x, a dedicated function `is_flash_attn_greater_or_equal_2_10` existed in `transformers.utils`
+to check whether Flash Attention 2.10 or higher was available.
+In v5.x, this was replaced by a generic `is_flash_attn_greater_or_equal(version_string)`,
+and the old function was removed.
 
-### エラーメッセージ
+### Error Message
 
 ```
 ImportError: cannot import name 'is_flash_attn_greater_or_equal_2_10' from 'transformers.utils'
 ```
 
-### 修正したファイル
+### Modified File
 
 `modeling_florence2.py`
 
-### 修正箇所 (L44-53)
+### Changes (L44-53)
 
 ```python
 try:
@@ -153,79 +154,79 @@ except ImportError:
             return True
 ```
 
-### 修正の意味
+### Rationale
 
-3段階のフォールバック：
-1. v4.x: 元の関数をそのまま使用
-2. v5.x: 新しい汎用関数で `"2.10"` を指定して同等の判定
-3. どちらも存在しない場合: `True` を返す（Flash Attention がインストール済みと仮定）
+Three-level fallback:
+1. v4.x: Use the original function as-is
+2. v5.x: Use the new generic function with `"2.10"` for equivalent behavior
+3. Neither available: Return `True` (assume Flash Attention is installed)
 
 ---
 
-## D. `_supports_flash_attn` クラス属性の新規要求
+## D. New `_supports_flash_attn` Class Attribute Requirement
 
-### 背景
+### Background
 
-transformers v5.x では、モデル初期化時に attention 実装のバリデーションが厳格化された。
-`attn_implementation="flash_attention_2"` を指定した場合、モデルクラスに
-`_supports_flash_attn = True` （v5.x で新設）が設定されていないと `ValueError` が発生する。
+In transformers v5.x, attention implementation validation was tightened during model initialization.
+When `attn_implementation="flash_attention_2"` is specified, the model class must have
+`_supports_flash_attn = True` (newly introduced in v5.x) set, or a `ValueError` is raised.
 
-v4.x では `_supports_flash_attn_2 = True` のみで十分だったが、
-v5.x ではそれに加えて `_supports_flash_attn = True` が必須になった。
+In v4.x, only `_supports_flash_attn_2 = True` was sufficient.
+In v5.x, `_supports_flash_attn = True` is additionally required.
 
-### エラーメッセージ
+### Error Message
 
 ```
 ValueError: Florence2ForConditionalGeneration does not support Flash Attention 2 yet.
 ```
 
-### 修正したファイル
+### Modified File
 
 `modeling_florence2.py`
 
-### 修正箇所
+### Changes
 
 **`Florence2LanguagePreTrainedModel`** (L1435-1437):
 
 ```python
-_supports_flash_attn_2 = True   # v4.x 互換
-_supports_flash_attn = True     # v5.x 新規要求
+_supports_flash_attn_2 = True   # v4.x compatibility
+_supports_flash_attn = True     # v5.x new requirement
 _supports_sdpa = True
 ```
 
 **`Florence2PreTrainedModel`** (L2366-2368):
 
 ```python
-_supports_flash_attn_2 = True   # v4.x 互換
-_supports_flash_attn = True     # v5.x 新規要求
+_supports_flash_attn_2 = True   # v4.x compatibility
+_supports_flash_attn = True     # v5.x new requirement
 _supports_sdpa = True
 ```
 
-### 修正の意味
+### Rationale
 
-Florence-2 は内部で Flash Attention 2 / SDPA の両方をサポートしている。
-これらのクラス属性を **両方の PreTrainedModel 基底クラス**に追加することで、
-transformers v5.x のバリデーションを通過できるようになる。
+Florence-2 internally supports both Flash Attention 2 and SDPA.
+Adding these class attributes to **both PreTrainedModel base classes** allows
+the model to pass transformers v5.x validation.
 
 ---
 
-## 追加修正: `configuration_florence2.py` - `forced_bos_token_id` 設定順序
+## Additional Fix: `configuration_florence2.py` - `forced_bos_token_id` Ordering
 
-### 背景
+### Background
 
-`Florence2LanguageConfig.__init__()` で `forced_bos_token_id` を設定していたが、
-`super().__init__(**kwargs)` がこの値を上書きしていた。
-transformers v5.x では `PretrainedConfig.__init__()` の内部処理が変わり、
-この上書きが顕在化した。
+`Florence2LanguageConfig.__init__()` set `forced_bos_token_id`, but
+`super().__init__(**kwargs)` was overwriting this value.
+In transformers v5.x, the internal handling in `PretrainedConfig.__init__()` changed,
+making this overwrite problem manifest.
 
-config.json で `forced_bos_token_id: 0` と指定されていても、
-`super().__init__()` の処理後に `None` や別の値になる場合がある。
+Even when config.json specifies `forced_bos_token_id: 0`,
+the value could become `None` or a different value after `super().__init__()`.
 
-### 修正したファイル
+### Modified File
 
 `configuration_florence2.py`
 
-### 修正箇所 (L253-266)
+### Changes (L253-266)
 
 ```python
 forced_bos = kwargs.pop('forced_bos_token_id', bos_token_id)
@@ -244,29 +245,29 @@ super().__init__(
 self.forced_bos_token_id = forced_bos
 ```
 
-### 修正の意味
+### Rationale
 
-`forced_bos_token_id` を `kwargs` から先に取り出し（`pop`）、
-`super().__init__()` の**後に**明示的に設定する。
-これにより、config.json の値が確実に反映される。
+Extract `forced_bos_token_id` from `kwargs` first (via `pop`),
+then explicitly set it **after** `super().__init__()`.
+This ensures the value from config.json is reliably preserved.
 
-`forced_bos_token_id` はデコーダの最初のトークンを強制するパラメータであり、
-この値が不正だと生成結果が完全に壊れる。
+`forced_bos_token_id` forces the first token in the decoder output.
+If this value is incorrect, generation results are completely broken.
 
 ---
 
-## 追加修正: `nodes.py` - `generation_config` の整合性確保
+## Additional Fix: `nodes.py` - `generation_config` Consistency
 
-### 背景
+### Background
 
-transformers v5.x では `GenerationMixin.generate()` が `generation_config` を参照する際のデフォルト値処理が変更された。
-`init_empty_weights` で作成したモデルには `generation_config` が正しく設定されない場合がある。
+In transformers v5.x, the default value handling when `GenerationMixin.generate()` references `generation_config` was changed.
+Models created with `init_empty_weights` may not have `generation_config` properly initialized.
 
-### 修正したファイル
+### Modified File
 
 `nodes.py`
 
-### 修正箇所 - `load_model()` 関数 (L78-91)
+### Changes - `load_model()` function (L78-91)
 
 ```python
 if len(tokenizer) != model.language_model.model.shared.num_embeddings:
@@ -284,35 +285,35 @@ if hasattr(model.language_model, 'generation_config'):
     gen_cfg.forced_eos_token_id = getattr(lang_config, 'forced_eos_token_id', 2)
 ```
 
-### 修正の意味
+### Rationale
 
-2つの処理を追加：
+Two operations are added:
 
-1. **トークナイザーのサイズチェック**: 特殊トークン（`<loc_0>`〜`<loc_999>` 等）追加後の
-   トークナイザーの語彙数がモデルの embedding サイズと一致しない場合、
-   `resize_token_embeddings()` で拡張し、`tie_weights()` を再実行する。
+1. **Tokenizer size check**: After adding special tokens (`<loc_0>` through `<loc_999>`, etc.),
+   if the tokenizer vocabulary size doesn't match the model's embedding size,
+   `resize_token_embeddings()` expands it and `tie_weights()` is re-executed.
 
-2. **`generation_config` の明示設定**: `decoder_start_token_id`, `eos_token_id`, `pad_token_id`,
-   `forced_bos_token_id`, `forced_eos_token_id` を config から手動で設定する。
-   これが不正だとデコードが開始できない・停止しない等の問題が発生する。
+2. **Explicit `generation_config` setup**: `decoder_start_token_id`, `eos_token_id`, `pad_token_id`,
+   `forced_bos_token_id`, and `forced_eos_token_id` are manually set from the config.
+   Incorrect values here cause issues like decoding failing to start or failing to stop.
 
 ---
 
-## 影響範囲
+## Scope of Impact
 
-| ファイル | 変更量 | 影響 |
-|---------|--------|------|
-| `modeling_florence2.py` | 6箇所 | モデル初期化・weight tying・FA2 サポート |
-| `configuration_florence2.py` | 1箇所 | config パラメータの正確性 |
-| `nodes.py` | 1箇所 | ロード後の整合性確保 |
+| File | Changes | Impact |
+|------|---------|--------|
+| `modeling_florence2.py` | 6 locations | Model init, weight tying, FA2 support |
+| `configuration_florence2.py` | 1 location | Config parameter accuracy |
+| `nodes.py` | 1 location | Post-load consistency |
 
-## テスト環境
+## Test Environment
 
 - transformers 5.4.0
 - PyTorch 2.x (CUDA)
-- Florence-2-large / Florence-2-large-ft で動作確認
+- Tested with Florence-2-large / Florence-2-large-ft
 
-## 後方互換性
+## Backward Compatibility
 
-すべての修正は `hasattr` チェックまたは `version.parse()` による分岐で実装しており、
-**transformers v4.x 環境でも動作する**。
+All fixes are implemented using `hasattr` checks or `version.parse()` branching,
+and **remain fully functional in transformers v4.x environments**.
