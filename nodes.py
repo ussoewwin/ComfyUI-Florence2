@@ -27,7 +27,12 @@ def load_model(model_path: str, attention: str, dtype: torch.dtype, offload_devi
     from accelerate.utils import set_module_tensor_to_device
 
     config = Florence2Config.from_pretrained(model_path)
-    config._attn_implementation = attention
+    sage_mode = None
+    if attention.startswith('sage_attention'):
+        sage_mode = attention
+        config._attn_implementation = 'sdpa'
+    else:
+        config._attn_implementation = attention
     with init_empty_weights():
         model = Florence2ForConditionalGeneration(config)
 
@@ -56,6 +61,16 @@ def load_model(model_path: str, attention: str, dtype: torch.dtype, offload_devi
     # Tie embeddings
     model.language_model.tie_weights()
     model = model.eval().to(dtype).to(offload_device)
+
+    if sage_mode:
+        from .modeling_florence2 import FLORENCE2_ATTENTION_CLASSES
+        SageClass = FLORENCE2_ATTENTION_CLASSES[sage_mode]
+        for module in model.modules():
+            if hasattr(module, 'self_attn') and module.self_attn.__class__.__name__.startswith('Florence2Sdpa'):
+                module.self_attn.__class__ = SageClass
+            if hasattr(module, 'encoder_attn') and module.encoder_attn.__class__.__name__.startswith('Florence2Sdpa'):
+                module.encoder_attn.__class__ = SageClass
+        print(f"Florence2 attention replaced with {sage_mode}")
 
     # Create image processor
     image_processor = CLIPImageProcessor(
@@ -168,7 +183,7 @@ class DownloadAndLoadFlorence2Model:
                     "default": 'fp16'
                     }),
             "attention": (
-                    [ 'flash_attention_2', 'sdpa', 'eager'],
+                    [ 'flash_attention_2', 'sdpa', 'eager', 'sage_attention_2', 'sage_attention_3'],
                     {
                     "default": 'sdpa'
                     }),
@@ -222,10 +237,13 @@ class DownloadAndLoadFlorence2Model:
             model, processor = load_model(model_path, attention, dtype, offload_device)
         else:
             from .modeling_florence2 import Florence2ForConditionalGeneration
+            attn_impl = 'sdpa' if attention.startswith('sage_attention') else attention
+            if attn_impl != attention:
+                print(f"{attention} requires transformers>=5.0, falling back to sdpa")
             try:
-                model = Florence2ForConditionalGeneration.from_pretrained(model_path, attn_implementation=attention, torch_dtype=dtype).to(offload_device)
+                model = Florence2ForConditionalGeneration.from_pretrained(model_path, attn_implementation=attn_impl, torch_dtype=dtype).to(offload_device)
             except TypeError:
-                model = Florence2ForConditionalGeneration.from_pretrained(model_path, attn_implementation=attention, dtype=dtype).to(offload_device)
+                model = Florence2ForConditionalGeneration.from_pretrained(model_path, attn_implementation=attn_impl, dtype=dtype).to(offload_device)
             processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
         if lora is not None:
@@ -284,7 +302,7 @@ class Florence2ModelLoader:
             "model": ([*s.model_paths], {"tooltip": "models are expected to be in Comfyui/models/LLM folder"}),
             "precision": (['fp16','bf16','fp32'],),
             "attention": (
-                    [ 'flash_attention_2', 'sdpa', 'eager'],
+                    [ 'flash_attention_2', 'sdpa', 'eager', 'sage_attention_2', 'sage_attention_3'],
                     {
                     "default": 'sdpa'
                     }),
@@ -325,10 +343,13 @@ class Florence2ModelLoader:
             model, processor = load_model(model_path, attention, dtype, offload_device)
         else:
             from .modeling_florence2 import Florence2ForConditionalGeneration
+            attn_impl = 'sdpa' if attention.startswith('sage_attention') else attention
+            if attn_impl != attention:
+                print(f"{attention} requires transformers>=5.0, falling back to sdpa")
             try:
-                model = Florence2ForConditionalGeneration.from_pretrained(model_path, attn_implementation=attention, torch_dtype=dtype).to(offload_device)
+                model = Florence2ForConditionalGeneration.from_pretrained(model_path, attn_implementation=attn_impl, torch_dtype=dtype).to(offload_device)
             except TypeError:
-                model = Florence2ForConditionalGeneration.from_pretrained(model_path, attn_implementation=attention, dtype=dtype).to(offload_device)
+                model = Florence2ForConditionalGeneration.from_pretrained(model_path, attn_implementation=attn_impl, dtype=dtype).to(offload_device)
             processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
         if lora is not None:
