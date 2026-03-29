@@ -400,7 +400,7 @@ class Florence2Run:
         return hashed_seed % (2**32)
 
     def encode(self, image, text_input, florence2_model, task, fill_mask, keep_model_loaded=False, 
-            num_beams=3, max_new_tokens=1024, do_sample=True, output_mask_select="", seed=None):
+            num_beams=1, max_new_tokens=1024, do_sample=True, output_mask_select="", seed=None):
         _, height, width, _ = image.shape
         annotated_image_tensor = None
         mask_tensor = None
